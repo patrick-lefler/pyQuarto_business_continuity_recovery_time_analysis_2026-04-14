@@ -1,0 +1,646 @@
+---
+title: "When the Clock Starts Ticking: A Survival Analysis of Business Continuity Recovery Times"
+subtitle: "Quantifying RTO achievement across information security, infrastructure, and third-party incidents"
+abstract: "Recovery time objectives exist on paper for every firm. Whether they hold under real incident conditions is a different question entirely. This analysis applies survival analysis — specifically the Kaplan-Meier estimator — to 800 simulated business continuity incidents across three incident categories to quantify where RTO commitments break down, by how much, and why the standard mean-based reporting framework obscures the answer. </br> </br> 
+
+Historically, infrastructure incidents breach their stated 8-hour RTO in roughly half of cases, despite producing the shortest median recovery times of any incident type. Information security incidents carry the heaviest tail risk, with 5% of events extending beyond 180 hours. Third-party incidents are the most variable category relative to their RTO target. Censored observations — incidents still open at the analysis snapshot date — are handled explicitly throughout, ensuring that the survival curves reflect the full uncertainty of the at-risk population rather than only completed recoveries."
+author: "Patrick Lefler"
+date: "April 14, 2026"
+
+format:
+  html:
+    theme:
+      - sandstone
+      - custom.scss
+    toc: true
+    toc-depth: 3
+    toc-title: "Contents"
+    toc-location: right
+    number-sections: false
+    smooth-scroll: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Show code"
+    fig-align: center
+    fig-width: 9
+    fig-height: 5.5
+    lightbox: true
+    self-contained: true
+    html-math-method: katex
+
+brand: _brand.yml
+
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+```{python}
+#| label: setup
+#| include: false
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.stats import norm
+from lifelines import KaplanMeierFitter, WeibullFitter
+from lifelines.statistics import logrank_test, multivariate_logrank_test
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from great_tables import GT, style, loc, vals
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── reproducibility ───────────────────────────────────────────────────────────
+RNG_SEED = 42
+rng = np.random.default_rng(RNG_SEED)
+```
+
+```{python}
+#| label: simulate-data
+#| include: false
+
+# ── Import simulation module ──────────────────────────────────────────────────
+# Source the simulation script. In production, replace with:
+# df = pd.read_csv("data/bcp_incidents.csv", parse_dates=["start_dt"])
+# For reproducibility, we call simulate_incidents() directly.
+
+exec(open("simulate_bcp_incidents.py").read())
+df = simulate_incidents(N_INCIDENTS)
+
+# ── Derived columns useful across sections ────────────────────────────────────
+df["year"]          = df["start_dt"].dt.year
+df["quarter"]       = df["start_dt"].dt.to_period("Q").astype(str)
+df["rto_excess_h"]  = (df["recovery_hours"] - df["rto_target_hours"]).clip(lower=0)
+df["event"]         = (~df["censored"]).astype(int)   # lifelines convention: 1 = event observed
+
+# ── Colour palette (consistent across all figures) ───────────────────────────
+PALETTE = {
+    "cyber":          "#D85A30",   # coral-400
+    "infrastructure": "#378ADD",   # blue-400
+    "third_party":    "#1D9E75",   # teal-400
+}
+
+TYPE_LABELS = {
+    "cyber":          "Cyber",
+    "infrastructure": "Infrastructure",
+    "third_party":    "Third-party",
+}
+
+df["type_label"] = df["incident_type"].map(TYPE_LABELS)
+```
+
+## Background
+
+Recovery time objectives are one of the most cited metrics in business continuity management. They appear in board risk appetites, regulatory filings under NIST, DORA and SR 11-7, and vendor contracts. What they rarely appear in is a rigorous quantitative analysis of whether they are actually met.
+
+The gap between stated and achieved RTO is not a failure of intent — it reflects a measurement problem. Most organisations track mean recovery time by incident category. The mean is a poor summary statistic for a right-skewed distribution: a small number of severe incidents with multi-day recoveries inflate the average far beyond the median experience, while simultaneously concealing the probability that any given incident will breach its target.
+
+Survival analysis resolves this directly. The Kaplan-Meier estimator produces a non-parametric estimate of the recovery time distribution that accounts for both completed recoveries and incidents still open at the observation date (right-censored observations). The resulting survival curve answers a question that a mean cannot: *given that an incident has not yet recovered, what is the probability it recovers within the next N hours?*
+
+This document presents that analysis across three incident categories — cyber, infrastructure, and third-party — using a synthetic dataset calibrated to published industry benchmarks from the Uptime Institute Annual Outage Analysis and ENISA Threat Landscape reports.
+
+::: {.callout-note icon="false"}
+## Kaplan-Meier Estimator
+
+The Kaplan-Meier estimator is a non-parametric statistical method for measuring the time until a defined event occurs — in this case, full incident recovery. Unlike a simple average, it produces a survival curve: a step function that traces the probability that an incident remains unresolved at any given hour. Its critical advantage is the principled handling of censored observations — incidents still open at the analysis date. Rather than discarding them, Kaplan-Meier incorporates them by reducing the at-risk population at each event time, preserving the information they contain. This makes it uniquely suited to business continuity data, where snapshot-date reporting invariably leaves a subset of incidents unresolved.
+:::
+
+------------------------------------------------------------------------
+
+## Data and methodology
+
+### Simulation design
+
+The dataset comprises `{python} len(df)` incidents spanning `{python} str(df["start_dt"].dt.date.min())` to `{python} str(df["start_dt"].dt.date.max())`, with a snapshot date of 30 June 2024 used to determine censoring status. Incident mix follows proportions consistent with the Verizon Data Breach Investigations Report: 40% cyber, 35% infrastructure, 25% third-party.
+
+Each incident carries two independently modelled duration variables — outage duration and recovery time — linked by a Gaussian copula with rank correlation ρ = 0.65. This structure is deliberate: recovery time is positively correlated with outage severity, but not a deterministic function of it. Hot-standby configurations and pre-positioned response playbooks mean that some long outages resolve quickly; conversely, some brief outages trigger complex investigation and remediation chains.
+
+```{python}
+#| label: tbl-simulation-params
+#| tbl-cap: "Simulation parameters and distributional assumptions by incident type"
+
+params_data = {
+    "Incident type": ["Cyber", "Infrastructure", "Third-party"],
+    "Outage distribution": ["Lognormal(μ=2.2, σ=1.2)", "Weibull(k=1.4, λ=6.0)", "Gamma(α=2.5, β=5.0) + 2h"],
+    "Recovery distribution": ["Lognormal(μ=3.0, σ=1.5)", "Weibull(k=1.6, λ=9.0)", "Gamma(α=3.0, β=6.0) + 2h"],
+    "RTO target (h)": [24, 8, 24],
+    "Calibration source": [
+        "ENISA TL 2023 (median ~18h, p95 ~240h)",
+        "Uptime Institute 2023 (median MTTR ~4h)",
+        "Internal vendor SLA benchmarks",
+    ],
+}
+
+params_df = pd.DataFrame(params_data)
+
+(
+    GT(params_df)
+    .tab_style(
+        style=style.text(weight="bold"),
+        locations=loc.column_labels(),
+    )
+    .tab_options(table_font_size="13px")
+)
+```
+
+### Censoring treatment
+
+Right-censoring arises through two mechanisms. Administrative censoring — incidents still open at the 30 June 2024 snapshot date — accounts for the majority. A small number of incidents are window-censored because their projected recovery end-date extends beyond the observation period. In both cases, `recovery_hours` for censored observations is replaced with the maximum observable duration (time from incident start to snapshot date), and an `event` flag of 0 is passed to the Kaplan-Meier fitter.
+
+```{python}
+#| label: tbl-dataset-summary
+#| tbl-cap: "Dataset summary by incident type"
+
+summary = (
+    df.groupby("incident_type")
+    .agg(
+        n=("incident_id", "count"),
+        censored=("censored", "sum"),
+        median_recovery=("recovery_hours", lambda x: round(df.loc[x.index][~df.loc[x.index, "censored"]]["recovery_hours"].median(), 1)),
+        p95_recovery=("recovery_hours", lambda x: round(df.loc[x.index][~df.loc[x.index, "censored"]]["recovery_hours"].quantile(0.95), 1)),
+        rto_met_pct=("rto_met", lambda x: round(x.mean() * 100, 1)),
+    )
+    .reset_index()
+)
+
+summary["incident_type"] = summary["incident_type"].map(TYPE_LABELS)
+summary.columns = ["Incident type", "N", "Censored", "Median recovery (h)", "p95 recovery (h)", "RTO achievement (%)"]
+
+(
+    GT(summary)
+    .tab_style(
+        style=style.text(weight="bold"),
+        locations=loc.column_labels(),
+    )
+    .tab_options(table_font_size="13px")
+)
+```
+
+------------------------------------------------------------------------
+
+## Descriptive analysis
+
+### Recovery time distributions
+
+The three incident categories produce markedly different recovery time profiles, which has direct implications for how RTO targets should be set and how headroom should be allocated in continuity plans.
+
+```{python}
+#| label: fig-recovery-distributions
+#| fig-cap: "Recovery time distributions by incident type (uncensored observations, log scale)"
+
+from scipy.stats import gaussian_kde
+
+uncensored = df[~df["censored"]].copy()
+
+fig = go.Figure()
+
+x_range = np.logspace(np.log10(0.5), np.log10(250), 600)
+x_log   = np.log(x_range)
+
+# Per-type rgba fill colours — hex PALETTE converted to rgba with distinct opacities
+FILL_RGBA = {
+    "cyber":          "rgba(216, 90,  48,  0.20)",
+    "infrastructure": "rgba(55,  138, 221, 0.20)",
+    "third_party":    "rgba(29,  158, 117, 0.20)",
+}
+
+for itype, colour in PALETTE.items():
+    subset  = uncensored[uncensored["incident_type"] == itype]["recovery_hours"].values
+    kde     = gaussian_kde(np.log(subset), bw_method=0.45)
+    density = kde(x_log)
+
+    fig.add_trace(go.Scatter(
+        x=x_range,
+        y=density,
+        fill="tozeroy",
+        mode="lines",
+        name=TYPE_LABELS[itype],
+        line=dict(color=colour, width=2.5),   # full opacity line
+        fillcolor=FILL_RGBA[itype],            # independently controlled fill
+    ))
+
+    med = float(np.median(subset))
+    fig.add_vline(
+        x=med,
+        line_dash="dot",
+        line_color=colour,
+        line_width=1.5,
+        annotation_text=f"{TYPE_LABELS[itype]} median: {med:.0f}h",
+        annotation_position="top left",
+        annotation_font_size=10,
+        annotation_font_color=colour,
+    )
+
+for itype, rto in {"cyber": 24, "infrastructure": 8, "third_party": 24}.items():
+    fig.add_vline(
+        x=rto,
+        line_dash="dash",
+        line_color=PALETTE[itype],
+        line_width=1,
+        opacity=0.45,
+    )
+
+fig.update_layout(
+    xaxis_title="Recovery time (hours)",
+    yaxis_title="Density (log-scale kernel estimate)",
+    height=420,
+    margin=dict(l=60, r=30, t=60, b=60),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font_family="Source Sans Pro, sans-serif",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    hovermode="x unified",
+)
+fig.update_xaxes(
+    type="log",
+    range=[np.log10(0.5), np.log10(250)],
+    showgrid=True,
+    gridcolor="#eeeeee",
+    tickvals=[1, 2, 4, 8, 16, 24, 48, 72, 120, 168, 250],
+    ticktext=["1h", "2h", "4h", "8h", "16h", "24h", "48h", "72h", "5d", "1wk", "250h"],
+)
+fig.update_yaxes(showgrid=True, gridcolor="#eeeeee", showticklabels=False)
+fig.show()
+```
+
+### Incident volume over time
+
+```{python}
+#| label: fig-volume-over-time
+#| fig-cap: "Quarterly incident volume by type"
+
+quarterly = (
+    df.groupby(["quarter", "incident_type"])
+    .size()
+    .reset_index(name="count")
+)
+quarterly["type_label"] = quarterly["incident_type"].map(TYPE_LABELS)
+
+fig = px.bar(
+    quarterly,
+    x="quarter",
+    y="count",
+    color="incident_type",
+    color_discrete_map=PALETTE,
+    labels={"count": "Incidents", "quarter": "Quarter", "incident_type": "Type"},
+    barmode="stack",
+)
+fig.update_layout(
+    height=380,
+    margin=dict(l=20, r=20, t=30, b=60),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font_family="Source Sans Pro, sans-serif",
+    legend=dict(title="", orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    xaxis_tickangle=-45,
+)
+fig.update_xaxes(showgrid=False)
+fig.update_yaxes(showgrid=True, gridcolor="#eeeeee")
+fig.show()
+```
+
+------------------------------------------------------------------------
+
+## Survival analysis
+
+### Kaplan-Meier recovery curves
+
+The Kaplan-Meier estimator treats recovery as a time-to-event process: the event of interest is full recovery, and each incident contributes to the at-risk set until it either recovers (event observed) or is censored. The resulting survival function S(t) gives the probability that an incident has *not yet recovered* by time t — equivalently, 1 − S(t) is the cumulative recovery probability.
+
+Censored observations are indicated by tick marks on each curve. Their presence is not a data quality issue — they are correctly handled by reducing the at-risk set at each event time, which is the mechanism that gives KM its advantage over a simple empirical CDF for incomplete data.
+
+```{python}
+#| label: fig-km-curves
+#| fig-cap: "Kaplan-Meier survival curves by incident type with 95% confidence intervals"
+
+fig = go.Figure()
+
+for itype, colour in PALETTE.items():
+    subset = df[df["incident_type"] == itype].copy()
+
+    kmf = KaplanMeierFitter()
+    kmf.fit(
+        subset["recovery_hours"],
+        event_observed=subset["event"],
+        label=TYPE_LABELS[itype],
+    )
+
+    t   = kmf.survival_function_.index
+    sf  = kmf.survival_function_.iloc[:, 0]
+    ci  = kmf.confidence_interval_survival_function_
+
+    # Confidence band
+    fig.add_trace(go.Scatter(
+        x=list(t) + list(t[::-1]),
+        y=list(ci.iloc[:, 1]) + list(ci.iloc[:, 0][::-1]),
+        fill="toself",
+        fillcolor=colour,
+        opacity=0.12,
+        line=dict(width=0),
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+
+    # KM step function
+    fig.add_trace(go.Scatter(
+        x=t, y=sf,
+        mode="lines",
+        name=TYPE_LABELS[itype],
+        line=dict(color=colour, width=2.5, shape="hv"),
+    ))
+
+    # Censored tick marks
+    cens_times = subset.loc[subset["censored"], "recovery_hours"]
+    cens_sf    = [float(kmf.survival_function_at_times([ct]).iloc[0]) for ct in cens_times]
+    fig.add_trace(go.Scatter(
+        x=cens_times, y=cens_sf,
+        mode="markers",
+        marker=dict(symbol="line-ns", size=8, color=colour,
+                    line=dict(color=colour, width=1.5)),
+        showlegend=False,
+        hovertemplate="Censored at %{x:.1f}h<extra></extra>",
+    ))
+
+# RTO reference lines
+for itype, rto in {"cyber": 24, "infrastructure": 8, "third_party": 24}.items():
+    fig.add_vline(
+        x=rto,
+        line_dash="dash",
+        line_color=PALETTE[itype],
+        line_width=1.2,
+        opacity=0.6,
+    )
+
+fig.add_hline(y=0.5, line_dash="dot", line_color="#999999", line_width=1,
+              annotation_text="Median survival", annotation_font_size=10,
+              annotation_font_color="#999999")
+
+fig.update_layout(
+    xaxis_title="Time to recovery (hours)",
+    yaxis_title="Probability not yet recovered  S(t)",
+    height=480,
+    margin=dict(l=20, r=20, t=30, b=50),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font_family="Source Sans Pro, sans-serif",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    yaxis=dict(tickformat=".0%", range=[0, 1.05]),
+    xaxis=dict(range=[0, 200]),
+)
+fig.update_xaxes(showgrid=True, gridcolor="#eeeeee")
+fig.update_yaxes(showgrid=True, gridcolor="#eeeeee")
+fig.show()
+```
+
+### Log-rank test: are the curves statistically different?
+
+```{python}
+#| label: tbl-logrank
+#| tbl-cap: "Multivariate log-rank test — null hypothesis: all survival curves are equal"
+
+results = multivariate_logrank_test(
+    df["recovery_hours"],
+    df["incident_type"],
+    event_col=df["event"],
+)
+
+lr_df = pd.DataFrame({
+    "Test statistic": [round(results.test_statistic, 3)],
+    "Degrees of freedom": [2],
+    "p-value": [round(results.p_value, 6)],
+    "Interpretation": ["Reject H₀ — curves are statistically distinct" if results.p_value < 0.05
+                       else "Fail to reject H₀"],
+})
+
+(
+    GT(lr_df)
+    .tab_style(style=style.text(weight="bold"), locations=loc.column_labels())
+    .tab_options(table_font_size="13px")
+)
+```
+
+::: {.callout-note icon="false"}
+## Why survival analysis is appropriate for this project
+
+Survival analysis is purpose-built for time-to-event data where not all outcomes are observed by the analysis date — precisely the structure of incident response records. Conventional approaches such as arithmetic means and achievement-rate percentages treat every open incident as missing data, discarding the information it contains. Survival analysis instead treats open incidents as right-censored observations: we know recovery took *at least* this long, even if we do not yet know how much longer. The Kaplan-Meier estimator incorporates that partial information by adjusting the at-risk population at each event time, producing an unbiased survival curve from incomplete data. For RTO analysis specifically, this matters because the incidents most likely to remain open at reporting date are disproportionately the severe ones — precisely the events that drive tail risk.
+:::
+
+### Median recovery time with confidence intervals
+
+The Kaplan-Meier median — the time at which S(t) crosses 0.5 — is a more robust summary statistic than the arithmetic mean for right-skewed recovery distributions. Unlike the mean, it is not distorted by the long-duration tail events that dominate cyber incidents.
+
+```{python}
+#| label: tbl-km-medians
+#| tbl-cap: "Kaplan-Meier median recovery time with 95% confidence intervals"
+
+def km_median_ci(kmf) -> tuple[float, float]:
+    """
+    Extract 95% CI for the KM median by finding where the upper and lower
+    confidence interval bands of the survival function cross S(t) = 0.5.
+    Returns (lower, upper) in the same time units as the fitted data.
+    Falls back to NaN if a band does not cross 0.5 (e.g. heavy censoring).
+    """
+    ci   = kmf.confidence_interval_survival_function_
+    t    = ci.index
+    low  = ci.iloc[:, 0]   # lower CI band (KM_estimate_lower_0.95)
+    high = ci.iloc[:, 1]   # upper CI band (KM_estimate_upper_0.95)
+
+    def first_crossing(band, threshold=0.5):
+        crossing = band[band <= threshold]
+        return float(crossing.index[0]) if len(crossing) > 0 else float("nan")
+
+    return first_crossing(high), first_crossing(low)
+
+
+rows = []
+for itype in ["cyber", "infrastructure", "third_party"]:
+    subset = df[df["incident_type"] == itype]
+    kmf    = KaplanMeierFitter()
+    kmf.fit(subset["recovery_hours"], event_observed=subset["event"])
+    med        = kmf.median_survival_time_
+    ci_lo, ci_hi = km_median_ci(kmf)
+    rows.append({
+        "Incident type":   TYPE_LABELS[itype],
+        "KM median (h)":   round(med, 1),
+        "95% CI lower":    round(ci_lo, 1),
+        "95% CI upper":    round(ci_hi, 1),
+        "RTO target (h)":  {"cyber": 24, "infrastructure": 8, "third_party": 24}[itype],
+    })
+
+km_medians = pd.DataFrame(rows)
+km_medians["Median vs RTO"] = km_medians.apply(
+    lambda r: "Within target" if r["KM median (h)"] <= r["RTO target (h)"] else "Exceeds target",
+    axis=1,
+)
+
+(
+    GT(km_medians)
+    .tab_style(style=style.text(weight="bold"), locations=loc.column_labels())
+    .tab_options(table_font_size="13px")
+)
+```
+
+------------------------------------------------------------------------
+
+## RTO achievement analysis
+
+### Achievement rates and exceedance magnitude
+
+Knowing that 50% of incidents breach their RTO is one data point. Knowing by *how much* they breach it is the operationally important question — it determines whether the shortfall is a matter of tightening playbooks or fundamentally revisiting the target.
+
+```{python}
+#| label: fig-rto-exceedance
+#| fig-cap: "RTO exceedance hours among breaching incidents (median line shown)"
+
+breaches = df[(~df["rto_met"]) & (~df["censored"])].copy()
+
+fig = make_subplots(rows=1, cols=3,
+                    subplot_titles=[TYPE_LABELS[t] for t in PALETTE],
+                    shared_yaxes=False)
+
+for col_idx, (itype, colour) in enumerate(PALETTE.items(), start=1):
+    subset = breaches[breaches["incident_type"] == itype]["rto_excess_h"]
+    med    = subset.median()
+
+    fig.add_trace(
+        go.Histogram(x=subset, marker_color=colour, opacity=0.75,
+                     nbinsx=30, name=TYPE_LABELS[itype], showlegend=False),
+        row=1, col=col_idx,
+    )
+    fig.add_vline(x=med, line_dash="dash", line_color=colour, line_width=2,
+                  row=1, col=col_idx,
+                  annotation_text=f"Median +{med:.0f}h",
+                  annotation_font_size=10,
+                  annotation_font_color=colour)
+
+fig.update_layout(
+    height=380,
+    margin=dict(l=20, r=20, t=50, b=50),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font_family="Source Sans Pro, sans-serif",
+)
+fig.update_xaxes(showgrid=True, gridcolor="#eeeeee", title_text="Hours beyond RTO")
+fig.update_yaxes(showgrid=True, gridcolor="#eeeeee", title_text="Incidents")
+fig.show()
+```
+
+### RTO achievement by severity
+
+```{python}
+#| label: fig-rto-by-severity
+#| fig-cap: "RTO achievement rate by incident type and severity"
+
+sev_rto = (
+    df.groupby(["incident_type", "severity"])["rto_met"]
+    .mean()
+    .mul(100)
+    .round(1)
+    .reset_index()
+)
+sev_rto["type_label"] = sev_rto["incident_type"].map(TYPE_LABELS)
+
+fig = px.bar(
+    sev_rto,
+    x="severity",
+    y="rto_met",
+    color="incident_type",
+    barmode="group",
+    color_discrete_map=PALETTE,
+    labels={"rto_met": "RTO achievement (%)", "severity": "Severity", "incident_type": "Type"},
+    category_orders={"severity": ["P1", "P2", "P3"]},
+)
+
+fig.add_hline(y=80, line_dash="dot", line_color="#888888", line_width=1.2,
+              annotation_text="80% target threshold",
+              annotation_font_size=10, annotation_font_color="#888888")
+
+fig.update_layout(
+    height=400,
+    margin=dict(l=20, r=20, t=30, b=50),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+    font_family="Source Sans Pro, sans-serif",
+    legend=dict(title="", orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    yaxis=dict(range=[0, 105], ticksuffix="%"),
+)
+fig.update_xaxes(showgrid=False)
+fig.update_yaxes(showgrid=True, gridcolor="#eeeeee")
+fig.show()
+```
+
+------------------------------------------------------------------------
+
+## Insights & Conclusion
+
+### What the data is actually telling us
+
+The three survival curves in this analysis look deceptively simple. What they encode is a fundamentally different story about business continuity risk than the one most fintech firms tell their boards. The standard reporting format — mean recovery time by incident category, measured against a stated RTO — flattens three distinct risk profiles into a single number and then grades each against a target that was, in many cases, set without reference to the underlying distribution. The Kaplan-Meier estimator forces that distribution into view. What follows is what that view reveals.
+
+### Infrastructure: the target is the problem
+
+Of the three incident categories, infrastructure is the most analytically tractable. The Weibull distribution with a shape parameter greater than one produces a well-behaved, relatively concentrated recovery time distribution with a tight p95. There are no 180-hour outliers. The median is the lowest of any category. And yet infrastructure achieves its stated 8-hour RTO only around half the time — a performance rate that, if reported to a board risk committee, would prompt an urgent remediation conversation.
+
+That conversation would be misdirected. The failure is not in operational response; it is in target calibration. An 8-hour RTO for infrastructure incidents implies that the firm expects to contain, diagnose, and resolve hardware or network failures — including third-tier escalations to vendors, physical replacement of failed components, and restoration of dependent services — within a single business shift. The survival curve shows that this is achievable for the majority of incidents only when they are minor. Any incident that requires physical intervention, vendor dispatch, or multi-system coordination will breach the target regardless of how well the response team performs.
+
+The corrective action is straightforward: recalibrate the infrastructure RTO to 12 hours for standard incidents, with a documented exception framework for P1 events that acknowledges a realistic 18–24 hour window. This is not a relaxation of standards — it is the replacement of an aspirational number with a defensible one. Boards and regulators respond better to credible commitments that are consistently met than to aggressive targets that are routinely missed.
+
+### Information security incidents: the tail is the risk
+
+The information security survival curve contains the most important single data point in this analysis: a p95 recovery time of approximately 180 hours. That number deserves a moment of direct interpretation. It means that for one in twenty incidents, the firm will still be in active recovery mode after a full calendar week. For a fintech firm with real-time payment or other similar obligations, regulatory notification windows of 72 hours under DORA, and customer SLAs measured in minutes, a 180-hour recovery tail is not a theoretical concern — it is the scenario that stress tests should be built around.
+
+Mean-based reporting conceals this exposure entirely. A mean recovery time of 50 hours, reported alongside a 24-hour RTO and a 46% achievement rate, tells the board that information security incidents are a chronic but manageable under-performance story. The survival curve tells a different story: most information security incidents resolve within 48 hours, but a meaningful minority enter a prolonged recovery regime that the standard playbook was not designed to handle. The step change in the Kaplan-Meier curve around the 48-hour mark is the operational signal — it marks the boundary between incidents that follow the standard escalation path and those that require a fundamentally different response posture.
+
+The practical implication is the creation of a tiered information security response framework with an explicit 48-hour trigger. Below that threshold, the standard incident response playbook applies. Beyond it, a separate severe event protocol should activate — one that includes executive-level war room governance, pre-approved vendor engagement authorities, regulatory notification preparation, and a dedicated communications track for affected counterparties. The 48-hour trigger is not arbitrary; it is where the data says the population of at-risk incidents becomes structurally different.
+
+### Third-party risk: governance is the only lever
+
+Third-party incidents present the most nuanced picture of the three categories. The RTO achievement rate, at 64%, sits between cyber and infrastructure. The median recovery time of approximately 20 hours is manageable. But the analysis contains a detail that aggregate achievement rates obscure: a meaningful portion of third-party recovery time is constitutionally irreducible through internal effort. The 2-hour notification floor built into the simulation is a modelling choice, but it reflects a real structural feature of third-party incidents — before a firm can begin its own recovery actions, it must first learn that an incident has occurred, confirm its scope, and receive a minimum level of technical information from the vendor. None of that time is within the firm's control.
+
+This has a direct implication for how third-party RTO targets should be structured and enforced. A single recovery time target measured from incident start conflates two entirely different time intervals: the vendor's obligation to notify and characterise the incident, and the firm's obligation to recover from it once notified. Separating these in contractual SLA terms — with a maximum notification window of, say, 90 minutes, and a separate recovery window measured from notification — creates two enforceable obligations rather than one unenforceable aggregate. Financial penalties tied to the notification window specifically create an incentive structure that standard SLAs do not.
+
+The severity distribution is also worth noting. Third-party incidents produce an unusually high proportion of P1 classifications relative to their volume. This reflects the structural reality that vendor failures tend to be broad in scope when they occur — a payment processor outage or a cloud provider availability event affects multiple systems simultaneously, which drives outage duration above the P1 threshold regardless of the technical complexity of the underlying failure. Firms that manage third-party risk primarily through contract terms and periodic reviews should consider supplementing that approach with real-time vendor health monitoring — not because it changes the contractual obligation, but because early detection compresses the effective notification lag.
+
+### On the methodology: why survival analysis belongs in the BCP toolkit
+
+A brief note on the analytical approach, for readers who may be considering applying it to their own data. The Kaplan-Meier estimator has been a standard tool in clinical trial analysis for over sixty years. Its application to business continuity data is less common than it should be, given that the underlying data structure — time-to-event observations with a meaningful proportion of incomplete (censored) cases — is structurally identical to the problems it was designed to solve.
+
+The specific advantage over conventional BCP reporting is the principled treatment of censored observations. An incident that is still open at the time of reporting is not missing data — it is a data point that contains genuine information about the lower bound of its eventual recovery time. Excluding it from the analysis, as mean-based reporting implicitly does, systematically understates the true recovery time distribution. Including it correctly, via the KM at-risk set mechanism, produces survival curves that reflect the full uncertainty of the population rather than only the completed cases. For a firm making RTO commitments to regulators and counterparties, that distinction matters.
+
+### Conclusion
+
+Business continuity is often treated as an operational hygiene discipline — important, periodically tested, and reported through a dashboard of green and amber metrics that reassure rather than inform. This analysis argues for a different posture: one in which RTO targets are derived from the empirical recovery time distribution rather than set against it, in which tail risk is quantified explicitly rather than implied by a mean, and in which the survival function is the primary reporting artifact rather than an achievement percentage.
+
+The three findings here — infrastructure targets that are calibrated too tightly, information security tail risk that is invisible in mean-based reporting, and third-party governance gaps that no internal process improvement can close — are not evidence of a poorly run program. They are structural features of how different incident types behave, and they require structural responses. The firms that will navigate the next generation of operational resilience regulation most credibly are those that can demonstrate not just that they have RTO targets, but that those targets are grounded in quantitative evidence about how their own incident populations actually recover.
+
+## Session information
+
+```{python}
+#| label: session-info
+#| code-fold: false
+
+import importlib, sys
+
+pkgs = ["numpy", "pandas", "scipy", "lifelines", "plotly", "great_tables"]
+rows = []
+for pkg in pkgs:
+    try:
+        mod = importlib.import_module(pkg)
+        ver = getattr(mod, "__version__", "unknown")
+    except ImportError:
+        ver = "not installed"
+    rows.append({"Package": pkg, "Version": ver})
+
+print(f"Python {sys.version}")
+print()
+si = pd.DataFrame(rows)
+print(si.to_string(index=False))
+```
+
+---
+
+Rendered with [Quarto](https://quarto.org/) \| Packages: `great_tables` `lifelines` `numby` `pandas` `plotly` `scipy`
