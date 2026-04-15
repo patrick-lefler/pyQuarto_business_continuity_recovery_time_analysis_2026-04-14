@@ -26,7 +26,7 @@ format:
     fig-height: 5.5
     lightbox: true
     self-contained: true
-    html-math-method: katex
+ 
 
 brand: _brand.yml
 
@@ -45,16 +45,19 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from scipy.stats import norm
-from lifelines import KaplanMeierFitter, WeibullFitter
-from lifelines.statistics import logrank_test, multivariate_logrank_test
+from lifelines import KaplanMeierFitter
+from lifelines.statistics import multivariate_logrank_test
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from great_tables import GT, style, loc, vals
+import plotly.io as pio
+from great_tables import GT, style, loc
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── reproducibility ───────────────────────────────────────────────────────────
+# Ensure plotly.js is embedded once across all figures
+pio.renderers.default = "notebook"
+
 RNG_SEED = 42
 rng = np.random.default_rng(RNG_SEED)
 ```
@@ -272,6 +275,7 @@ fig.show()
 ```{python}
 #| label: fig-volume-over-time
 #| fig-cap: "Quarterly incident volume by type"
+#| fig-format: png
 
 quarterly = (
     df.groupby(["quarter", "incident_type"])
@@ -495,6 +499,7 @@ Knowing that 50% of incidents breach their RTO is one data point. Knowing by *ho
 ```{python}
 #| label: fig-rto-exceedance
 #| fig-cap: "RTO exceedance hours among breaching incidents (median line shown)"
+#| fig-format: png
 
 breaches = df[(~df["rto_met"]) & (~df["censored"])].copy()
 
@@ -534,6 +539,7 @@ fig.show()
 ```{python}
 #| label: fig-rto-by-severity
 #| fig-cap: "RTO achievement rate by incident type and severity"
+#| fig-format: png
 
 sev_rto = (
     df.groupby(["incident_type", "severity"])["rto_met"]
