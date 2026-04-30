@@ -4,7 +4,7 @@
 
 **Author:** Patrick Lefler </br>
 **Published:** April 14, 2026 <br/>
-**Rendered:** 
+**Rendered:** https://patrick-lefler.github.io/pyQuarto_business_continuity_recovery_time_analysis_2026-04-14/
 
 ---
 
