@@ -63,5 +63,5 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 ## Contact
 
-Patrick Lefler — [LinkedIn](https://www.linkedin.com/in/patricklefler/) | [patrick-lefler.github.io](https://patrick-lefler.github.io) | [Substack](https://substack.com/@pflefler)
+Patrick Lefler — [LinkedIn](https://www.linkedin.com/in/patricklefler/) | [Website](https://patrick-lefler.github.io) | [Substack](https://substack.com/@pflefler)
 
