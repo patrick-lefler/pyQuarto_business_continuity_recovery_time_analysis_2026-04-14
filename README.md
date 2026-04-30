@@ -2,8 +2,8 @@
 
 > Quantifying RTO achievement across information security, infrastructure, and third-party incidents
 
-**Author:** Patrick Lefler
-**Published:** April 14, 2026
+**Author:** Patrick Lefler </br>
+**Published:** April 14, 2026 <br/>
 **Rendered:** 
 
 ---
